@@ -26,7 +26,14 @@ namespace UnityGLTF
 {
 	public class ImportOptions
 	{
+#pragma warning disable CS0618 // Type or member is obsolete
 		public ILoader ExternalDataLoader = null;
+#pragma warning restore CS0618 // Type or member is obsolete
+
+		/// <summary>
+		/// Optional <see cref="IDataLoader"/> for loading references from the GLTF to external streams.  May also optionally implement <see cref="IDataLoader2"/>.
+		/// </summary>
+		public IDataLoader DataLoader = null;
 		public AsyncCoroutineHelper AsyncCoroutineHelper = null;
 		public bool ThrowOnLowMemory = true;
 	}
@@ -208,6 +215,10 @@ namespace UnityGLTF
 		{
 			_gltfFileName = gltfFileName;
 			_options = options;
+			if (_options.DataLoader == null)
+			{
+				_options.DataLoader = LegacyLoaderWrapper.Wrap(_options.ExternalDataLoader);
+			}
 		}
 
 		public GLTFSceneImporter(GLTFRoot rootNode, Stream gltfStream, ImportOptions options)
@@ -220,6 +231,10 @@ namespace UnityGLTF
 			}
 
 			_options = options;
+			if (_options.DataLoader == null)
+			{
+				_options.DataLoader = LegacyLoaderWrapper.Wrap(_options.ExternalDataLoader);
+			}
 		}
 
 		/// <summary>
@@ -252,7 +267,7 @@ namespace UnityGLTF
 		{
 			_options = new ImportOptions
 			{
-				ExternalDataLoader = externalDataLoader,
+				DataLoader = LegacyLoaderWrapper.Wrap(externalDataLoader),
 				AsyncCoroutineHelper = asyncCoroutineHelper
 			};
 		}
@@ -497,8 +512,7 @@ namespace UnityGLTF
 				// we only load the streams if not a base64 uri, meaning the data is in the uri
 				if (image.Uri != null && !URIHelper.IsBase64Uri(image.Uri))
 				{
-					await _options.ExternalDataLoader.LoadStream(image.Uri);
-					_assetCache.ImageStreamCache[sourceId] = _options.ExternalDataLoader.LoadedStream;
+					_assetCache.ImageStreamCache[sourceId] = await _options.DataLoader.LoadStreamAsync(image.Uri);
 				}
 				else if (image.Uri == null && image.BufferView != null && _assetCache.BufferCache[image.BufferView.Value.Buffer.Id] == null)
 				{
@@ -524,9 +538,10 @@ namespace UnityGLTF
 		private async Task LoadJson(string jsonFilePath)
 		{
 #if !WINDOWS_UWP
-			if (IsMultithreaded && _options.ExternalDataLoader.HasSyncLoadMethod)
+			var dataLoader2 = _options.DataLoader as IDataLoader2;
+			if (IsMultithreaded && dataLoader2 != null)
 			{
-				Thread loadThread = new Thread(() => _options.ExternalDataLoader.LoadStreamSync(jsonFilePath));
+				Thread loadThread = new Thread(() => _gltfStream.Stream = dataLoader2.LoadStream(jsonFilePath));
 				loadThread.Priority = ThreadPriority.Highest;
 				loadThread.Start();
 				RunCoroutineSync(WaitUntilEnum(new WaitUntil(() => !loadThread.IsAlive)));
@@ -534,11 +549,9 @@ namespace UnityGLTF
 			else
 #endif
 			{
-				// HACK: Force the coroutine to run synchronously in the editor
-				await _options.ExternalDataLoader.LoadStream(jsonFilePath);
+				_gltfStream.Stream = await _options.DataLoader.LoadStreamAsync(jsonFilePath);
 			}
 
-			_gltfStream.Stream = _options.ExternalDataLoader.LoadedStream;
 			_gltfStream.StartPosition = 0;
 
 #if !WINDOWS_UWP
@@ -687,8 +700,7 @@ namespace UnityGLTF
 				}
 				else
 				{
-					await _options.ExternalDataLoader.LoadStream(buffer.Uri);
-					bufferDataStream = _options.ExternalDataLoader.LoadedStream;
+					bufferDataStream = await _options.DataLoader.LoadStreamAsync(buffer.Uri);
 				}
 
 				Debug.Assert(_assetCache.BufferCache[bufferIndex] == null);
@@ -862,9 +874,12 @@ namespace UnityGLTF
 					Offset = (uint)bufferData.ChunkOffset
 				};
 			}
-			try { 
+			try
+			{
 				GLTFHelpers.BuildMeshAttributes(ref attributeAccessors);
-			} catch (GLTFLoadException e) {
+			}
+			catch (GLTFLoadException e)
+			{
 				Debug.LogWarning(e.ToString());
 			}
 			TransformAttributes(ref attributeAccessors);
@@ -1197,6 +1212,7 @@ namespace UnityGLTF
 				} // switch target type
 			} // foreach channel
 
+			clip.EnsureQuaternionContinuity();
 			return clip;
 		}
 		#endregion
@@ -1523,7 +1539,7 @@ namespace UnityGLTF
 		private void CreateBoneWeightArray(Vector4[] joints, Vector4[] weights, ref BoneWeight[] destArr, int offset = 0)
 		{
 			// normalize weights (built-in normalize function only normalizes three components)
-			for(int i = 0; i < weights.Length; i++)
+			for (int i = 0; i < weights.Length; i++)
 			{
 				var weightSum = (weights[i].x + weights[i].y + weights[i].z + weights[i].w);
 
@@ -1547,22 +1563,17 @@ namespace UnityGLTF
 			}
 		}
 
-		// Should be allocated pretty compactly, but still allows row access unlike a rectangular array
-		private T[][] Allocate2dArray<T>(uint x, uint y)
+		/// <summary>
+		/// Allocate a generic type 2D array. The size is depending on the given parameters.
+		/// </summary>		
+		/// <param name="x">Defines the depth of the arrays first dimension</param>
+		/// <param name="y">>Defines the depth of the arrays second dimension</param>
+		/// <returns></returns>
+		private static T[][] Allocate2dArray<T>(uint x, uint y)
 		{
-			switch (x)
-			{
-				case 0: return new T[][] { };
-				case 1: return new T[][] { new T[y] };
-				case 2: return new T[][] { new T[y], new T[y] };
-				case 3: return new T[][] { new T[y], new T[y], new T[y] };
-				case 4: return new T[][] { new T[y], new T[y], new T[y], new T[y] };
-				case 5: return new T[][] { new T[y], new T[y], new T[y], new T[y], new T[y] };
-				case 6: return new T[][] { new T[y], new T[y], new T[y], new T[y], new T[y], new T[y] };
-				case 7: return new T[][] { new T[y], new T[y], new T[y], new T[y], new T[y], new T[y], new T[y] };
-				case 8: return new T[][] { new T[y], new T[y], new T[y], new T[y], new T[y], new T[y], new T[y], new T[y] };
-				default: throw new ArgumentOutOfRangeException(nameof(x));
-			}
+			var result = new T[x][];
+			for (var i = 0; i < x; i++) result[i] = new T[y];
+			return result;
 		}
 
 		/// <summary>
@@ -1713,7 +1724,7 @@ namespace UnityGLTF
 			var targets = primData.Targets;
 			if (targets != null)
 			{
-				for(int i = 0; i < targets.Count; ++i)
+				for (int i = 0; i < targets.Count; ++i)
 				{
 					if (targets[i].ContainsKey(SemanticProperties.POSITION))
 					{
@@ -2323,7 +2334,8 @@ namespace UnityGLTF
 
 		protected static MeshTopology GetTopology(DrawMode mode)
 		{
-			switch (mode) {
+			switch (mode)
+			{
 				case DrawMode.Points: return MeshTopology.Points;
 				case DrawMode.Lines: return MeshTopology.Lines;
 				case DrawMode.LineStrip: return MeshTopology.LineStrip;
